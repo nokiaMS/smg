@@ -2297,9 +2297,16 @@ impl PDRouter {
         if connection_close {
             request = request.header("Connection", "close");
         }
+        // Only the opt-in K3 facade (the public ingress) can mint this hint.
+        // Never expand the header allow-list for external providers or stock PD.
+        static K3_CACHE_RECEIPTS: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            std::env::var("K3_KVV_FACADE_ENABLED").as_deref() == Ok("1")
+        });
         if let Some(headers) = headers {
             for (name, value) in headers {
-                if header_utils::should_forward_request_header(name.as_str()) {
+                if header_utils::should_forward_request_header(name.as_str())
+                    || (*K3_CACHE_RECEIPTS && name.as_str() == "x-sglang-cache-retention-ttl")
+                {
                     if let Ok(val) = value.to_str() {
                         request = request.header(name, val);
                     }

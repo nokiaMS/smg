@@ -18,6 +18,69 @@ except ImportError:
     logger.warning("Rust Router is not installed")
 
 
+# ---------------------------------------------------------------------------
+# K3 KVV overlay — strictly opt-in.
+#
+# Activates ONLY when K3_KVV_FACADE_ENABLED=1 is set (e.g. in /spinfield/env).
+# The unmodified Rust gateway then moves to a private loopback port and the
+# k3_kvv_facade protocol facade owns the public one. Default: OFF.
+# ---------------------------------------------------------------------------
+def _k3_kvv_upstream_port() -> int:
+    import os
+
+    return int(os.environ.get("K3_KVV_UPSTREAM_PORT", "8300"))
+
+
+_K3_KVV_FACADE_PROC = None
+_K3_KVV_UPSTREAM_HOST = "127.0.0.1"
+_K3_KVV_UPSTREAM_PORT = _k3_kvv_upstream_port()
+
+def _k3_kvv_should_overlay() -> bool:
+    """Strictly opt-in: the overlay activates ONLY when the operator sets
+    K3_KVV_FACADE_ENABLED=1 (e.g. in /spinfield/env). Default in the repo is
+    OFF so upstream behavior is byte-identical without explicit opt-in."""
+    import os
+
+    if os.environ.get("K3_KVV_FACADE_ENABLED") != "1":
+        return False
+    try:
+        import smg.k3_kvv_facade  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def _k3_kvv_start_facade(public_host: str, public_port: int | str) -> None:
+    """Start the facade subprocess bound to the public address before the
+    Rust gateway takes the loopback port; probe failures while the facade
+    is up therefore reflect the real backend, never a false healthy."""
+    import os
+    import subprocess
+    import sys
+    import time
+
+    global _K3_KVV_FACADE_PROC
+    env = {
+        **os.environ,
+        "PYTHONUNBUFFERED": "1",
+        "K3_KVV_UPSTREAM_PORT": str(_k3_kvv_upstream_port()),
+        "K3_KVV_FACADE_PORT": str(public_port),
+    }
+    _K3_KVV_FACADE_PROC = subprocess.Popen(
+        [sys.executable, "-m", "smg.k3_kvv_facade"],
+        env=env,
+    )
+    time.sleep(1.0)
+    if _K3_KVV_FACADE_PROC.poll() is not None:
+        raise RuntimeError(
+            f"k3_kvv_facade exited immediately with code {_K3_KVV_FACADE_PROC.returncode}"
+        )
+    logger.info(
+        "k3-kvv facade on %s:%s -> smg on %s:%s",
+        public_host, public_port, _K3_KVV_UPSTREAM_HOST, env["K3_KVV_UPSTREAM_PORT"],
+    )
+
+
 def launch_router(args: argparse.Namespace | RouterArgs) -> None:
     """
     Launch the SMG router with the configuration from parsed arguments.
@@ -53,7 +116,16 @@ def launch_router(args: argparse.Namespace | RouterArgs) -> None:
             mode = "PD Disaggregated"
         else:
             mode = "Regular"
+        public_host, public_port = router_args.host, router_args.port
+        if _k3_kvv_should_overlay():
+            # The facade owns the public port; the Rust gateway moves to the
+            # private loopback one and keeps its original startup args intact
+            # apart from the bind address.
+            router_args.host = _K3_KVV_UPSTREAM_HOST
+            router_args.port = _K3_KVV_UPSTREAM_PORT
         print_banner(router_args.host, router_args.port, mode)
+        if _k3_kvv_should_overlay():
+            _k3_kvv_start_facade(public_host, public_port)
 
         router = Router.from_args(router_args)
         router.start()
