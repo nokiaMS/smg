@@ -30,6 +30,20 @@ Responsibilities (K3 KVV customer contract, protocol_cache_bench 2.7.0):
    as zero — the request simply keeps the worker's own accounting.
    Non-opt-in paths never receive Msh headers from this facade.
 
+4. Chat billing group: a K3.1 worker additionally reports the public-basis
+   prompt token count in the private ``x-sglang-reported-prompt-tokens``
+   header (decimal, signed int32, minted at most once, never derived from
+   C+W). When the receipt and that count agree (C+W <= P), the facade
+   publishes ``Msh-Usage-Prompt-Tokens``=P and ``Msh-Usage-Cached-Tokens``=C
+   and aligns the body's ``usage.prompt_tokens`` with the measured P.
+   Missing, malformed, duplicated or contradictory evidence publishes no
+   partial group: a legacy worker reporting only the receipt keeps its old
+   C,W,A read/write evidence, and nothing more is asserted. The private
+   ``x-sglang-*`` markers (including the reported count) never escape the
+   client-facing interface, and any ``msh-usage-*`` headers coming from
+   upstream (worker-minted or echoed) are dropped so the facade stays the
+   single source of truth.
+
 Everything else (bodies, SSE payloads, status codes, headers) is forwarded
 byte-for-byte in both directions.
 """
@@ -57,10 +71,17 @@ VALID_TTL_BUCKETS = ("5m", "1h")  # customer's cache_ttl_values; the regex is th
 
 MSH_WRITE_HEADER = "msh-usage-cache-write-tokens-{ttl}"
 MSH_READ_HEADER = "msh-usage-cache-read-tokens"
+MSH_PROMPT_HEADER = "msh-usage-prompt-tokens"
+MSH_CACHED_HEADER = "msh-usage-cached-tokens"
 
 # Private wire with the worker middleware (owned by Main/WorkerK3):
 HINT_HEADER = "x-sglang-cache-retention-ttl"
 RECEIPT_HEADER = "x-sglang-prompt-cache-receipt"
+REPORTED_HEADER = "x-sglang-reported-prompt-tokens"
+
+# A worker-decoded receipt: (cached, write, approved_seconds).
+Receipt = tuple[int, int, int]
+
 
 # The upstream SMG gateway: loopback only, never directly reachable.
 # Ports come from the launch_router overlay via env, with the same defaults.
@@ -195,22 +216,25 @@ def _extract_hint(body: dict, route: str) -> tuple[str | None, int | None]:
 
 
 def _clean_request_headers(headers) -> dict[str, str]:
-    """Forward request headers minus hop-by-hop and any client-supplied
-    private ``x-sglang-*`` markers: only the facade may mint those."""
+    """Forward request headers minus hop-by-hop, any client-supplied private
+    ``x-sglang-*`` markers and any client-supplied public ``msh-usage-*``
+    evidence: only the facade may mint either."""
     out = {}
     for name, value in headers.items():
         low = name.lower()
-        if low in HOP_BY_HOP or low.startswith("x-sglang-"):
+        if low in HOP_BY_HOP or low.startswith("x-sglang-") or low.startswith("msh-usage-"):
             continue
         out[name] = value
     return out
 
 
-def _parse_receipt(value: str | None) -> tuple[int, int, int] | None:
-    """Decode ``R,W,A`` decimal receipt; None when absent or malformed."""
-    if not value:
+def _parse_receipt(values) -> Receipt | None:
+    """Decode the ``R,W,A`` decimal receipt. The worker sets the header at
+    most once; more (or anything malformed) means the evidence is not
+    trustworthy, so no complete group is asserted."""
+    if len(values) != 1:
         return None
-    parts = value.split(",")
+    parts = values[0].split(",")
     if len(parts) != 3:
         return None
     try:
@@ -222,15 +246,65 @@ def _parse_receipt(value: str | None) -> tuple[int, int, int] | None:
     return r, w, a
 
 
+def _parse_reported(values) -> int | None:
+    """Decode the private ``x-sglang-reported-prompt-tokens`` public basis.
+    K3.1: nonnegative signed int32, minted at most once per response."""
+    if len(values) != 1:
+        return None
+    value = values[0].strip()
+    if not value.isascii() or not value.isdecimal():
+        return None
+    try:
+        tokens = int(value)
+    except (ValueError, OverflowError):
+        return None
+    if tokens < 0 or tokens > 2**31 - 1:
+        return None
+    return tokens
+
+
+def _parse_chat_group(headers) -> tuple[Receipt | None, int | None]:
+    """Chat billing group: the receipt C,W,A plus the separately reported
+    public basis P. Both halves validate independently — a worker that
+    reports only the legacy receipt keeps its C,W,A read/write evidence,
+    and a worker that reports only P keeps nothing asserted. The public
+    ``Msh-Usage-Prompt-Tokens`` / ``Msh-Usage-Cached-Tokens`` pair is
+    emitted only when both are present and C+W <= P; contradictory
+    evidence suppresses both halves together."""
+    raw = headers.get_list(RECEIPT_HEADER)
+    receipt = _parse_receipt(raw)
+    if receipt is not None and (
+        not all(v.strip().isascii() and v.strip().isdecimal() for v in raw[0].split(","))
+        or max(receipt[:2]) > 2**31 - 1
+    ):
+        return None, None
+    if receipt is not None and receipt[2] == 0:
+        # No retention was granted. Keep the legacy receipt, not the billing group.
+        return receipt, None
+    reported = _parse_reported(headers.get_list(REPORTED_HEADER))
+    if receipt is not None and reported is not None and receipt[0] + receipt[1] > reported:
+        # C+W must fit in P: contradictory worker evidence, trust neither.
+        return None, None
+    return receipt, reported
+
+
 def _clean_response_headers(headers) -> dict[str, str]:
     """Response headers minus hop-by-hop (incl. content-encoding: httpx has
     already decoded the body, so keeping it would mislabel the bytes), the
-    private receipt marker and SMG's own error-code header; the facade
-    re-issues the public Msh evidence itself."""
+    private markers and SMG's own error-code header; the facade re-issues
+    the public Msh evidence itself, so any Msh headers the upstream echoed
+    or a worker minted directly are dropped here to avoid contradictory or
+    duplicated billing evidence."""
     out = {}
     for name, value in headers.items():
         low = name.lower()
-        if low in HOP_BY_HOP or low == RECEIPT_HEADER or low == "x-smg-error-code":
+        if (
+            low in HOP_BY_HOP
+            or low == RECEIPT_HEADER
+            or low == REPORTED_HEADER
+            or low == "x-smg-error-code"
+            or low.startswith("msh-usage-")
+        ):
             continue
         out[name] = value
     return out
@@ -247,19 +321,25 @@ def _applied_bucket(approved_s: int) -> str | None:
     return None
 
 
-def _receipt_to_msh(receipt: tuple[int, int, int]) -> dict[str, str]:
+def _receipt_to_msh(receipt: Receipt, route: str, reported: int | None = None) -> dict[str, str]:
     """Vendor evidence headers per pcc_cache_ttl.HEADER_NAMES. Both write
     buckets are always present; the approved-retention bucket carries W,
-    the other a measured zero. Read evidence always present."""
+    the other a measured zero. Read evidence always present. Chat adds the
+    billing pair ``Msh-Usage-Prompt-Tokens``=P / ``Msh-Usage-Cached-Tokens``
+    =C, but only when the worker also reported the public basis P: a
+    partial (receipt-only) worker never gets a half-group."""
     read, write, approved = receipt
     headers = {MSH_READ_HEADER: str(read)}
     applied = _applied_bucket(approved)
     for bucket in VALID_TTL_BUCKETS:
         headers[MSH_WRITE_HEADER.format(ttl=bucket)] = str(write if bucket == applied else 0)
+    if route == "/v1/chat/completions" and reported is not None:
+        headers[MSH_PROMPT_HEADER] = str(reported)
+        headers[MSH_CACHED_HEADER] = str(read)
     return headers
 
 
-def _receipt_to_usage_patch(receipt: tuple[int, int, int], route: str) -> dict:
+def _receipt_to_usage_patch(receipt: Receipt, route: str) -> dict:
     """Protocol-native usage fields for the receipt.
 
     - messages: ``cache_read_input_tokens`` / ``cache_creation_input_tokens``
@@ -298,7 +378,8 @@ def _deep_merge_usage(base: dict, patch: dict) -> None:
 # Response rewriting (non-streaming)
 # ---------------------------------------------------------------------------
 
-def _apply_receipt_json(raw: bytes, receipt: tuple[int, int, int], route: str, requested_ttl: str | None) -> bytes:
+def _apply_receipt_json(raw: bytes, receipt: Receipt, route: str, requested_ttl: str | None,
+                        reported: int | None = None) -> bytes:
     """Merge the receipt into the JSON usage object; add the per-bucket
     ``cache_creation.ephemeral_<ttl>_input_tokens`` split for Messages."""
     try:
@@ -319,6 +400,10 @@ def _apply_receipt_json(raw: bytes, receipt: tuple[int, int, int], route: str, r
                 split[f"ephemeral_{bucket}_input_tokens"] = receipt[1] if bucket == applied else 0
     elif route == "/v1/responses":
         obj["prompt_cache_options"] = _applied_options(requested_ttl, receipt[2])
+    elif route == "/v1/chat/completions" and reported is not None:
+        # Billing group complete: the body's ``prompt_tokens`` must agree
+        # with the measured P the headers carry.
+        usage["prompt_tokens"] = reported
     return json.dumps(obj, ensure_ascii=False).encode("utf-8")
 
 
@@ -330,7 +415,8 @@ def _apply_receipt_json(raw: bytes, receipt: tuple[int, int, int], route: str, r
 
 
 
-def _patch_sse_line(line: str, receipt, route, requested_ttl, state: dict) -> str:
+def _patch_sse_line(line: str, receipt, route, requested_ttl, state: dict,
+                    reported: int | None = None) -> str:
     """Rewrite one SSE line's JSON data when it carries the protocol's
     usage accounting. Returns the original line when anything is off."""
     stripped = line.strip()
@@ -349,6 +435,9 @@ def _patch_sse_line(line: str, receipt, route, requested_ttl, state: dict) -> st
     if route == "/v1/chat/completions":
         if isinstance(obj.get("usage"), dict) and obj.get("choices") in (None, []):
             _deep_merge_usage(obj["usage"], _receipt_to_usage_patch(receipt, route))
+            if reported is not None:
+                # Billing group complete: body agrees with measured P.
+                obj["usage"]["prompt_tokens"] = reported
             changed = True
     elif route == "/v1/messages":
         kind = obj.get("type")
@@ -394,7 +483,7 @@ def _patch_sse_line(line: str, receipt, route, requested_ttl, state: dict) -> st
 
 
 async def _stream_relay(upstream: httpx.Response, route: str, requested_ttl: str | None,
-                        receipt: tuple[int, int, int] | None):
+                        receipt: Receipt | None, reported: int | None = None):
     """Split the upstream byte stream into complete SSE lines, patch the
     accounting events, and re-emit with identical framing. The upstream is
     closed on normal exhaustion AND on client disconnect (GeneratorExit)."""
@@ -409,10 +498,12 @@ async def _stream_relay(upstream: httpx.Response, route: str, requested_ttl: str
             *complete, buffer = buffer.split(b"\n")
             for line_bytes in complete:
                 line = line_bytes.decode("utf-8", "replace")
-                yield (_patch_sse_line(line, receipt, route, requested_ttl, state) + "\n").encode("utf-8")
+                yield (_patch_sse_line(line, receipt, route, requested_ttl, state,
+                                      reported) + "\n").encode("utf-8")
         if buffer:
             line = buffer.decode("utf-8", "replace")
-            yield _patch_sse_line(line, receipt, route, requested_ttl, state).encode("utf-8")
+            yield _patch_sse_line(line, receipt, route, requested_ttl, state,
+                                  reported).encode("utf-8")
     finally:
         await upstream.aclose()
 
@@ -471,22 +562,26 @@ async def _proxy(request: Request, route: str) -> Response:
     success = 200 <= status < 300
     try:
         receipt = None
+        reported = None
         if requested_ttl is not None and success:
-            receipt = _parse_receipt(upstream.headers.get(RECEIPT_HEADER))
+            if route == "/v1/chat/completions":
+                receipt, reported = _parse_chat_group(upstream.headers)
+            else:
+                receipt = _parse_receipt(upstream.headers.get_list(RECEIPT_HEADER))
         resp_headers = _clean_response_headers(upstream.headers)
         if receipt is not None:
-            resp_headers.update(_receipt_to_msh(receipt))
+            resp_headers.update(_receipt_to_msh(receipt, route, reported))
 
         if is_sse and success:
             return StreamingResponse(
-                _stream_relay(upstream, route, requested_ttl, receipt),
+                _stream_relay(upstream, route, requested_ttl, receipt, reported),
                 status_code=status,
                 headers=resp_headers,
                 media_type="text/event-stream",
             )
         raw = await upstream.aread()
         if receipt is not None:
-            raw = _apply_receipt_json(raw, receipt, route, requested_ttl)
+            raw = _apply_receipt_json(raw, receipt, route, requested_ttl, reported)
         return Response(raw, status_code=status, headers=resp_headers)
     finally:
         # Streaming bodies close their upstream in _stream_relay (also on
